@@ -18,6 +18,7 @@
 #include "rocm_memory.h"
 #include "neuron_memory.h"
 #include "hl_memory.h"
+#include "mlu_memory.h"
 #include<math.h>
 #ifdef HAVE_RO
 #include <stdbool.h>
@@ -34,6 +35,9 @@ static const char *portStates[] = {"Nop","Down","Init","Armed","","Active Defer"
 static const char *qp_state[] = {"OFF","ON"};
 static const char *exchange_state[] = {"Ethernet","rdma_cm"};
 static const char *atomicTypesStr[] = {"CMP_AND_SWAP","FETCH_AND_ADD"};
+#ifdef HAVE_HNSDV
+static const char *congestStr[] = {"DCQCN","LDCP","HC3","DIP"};
+#endif
 
 /******************************************************************************
  * parse_mac_from_str.
@@ -438,6 +442,11 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 	printf("      --cpu_util ");
 	printf(" Show CPU Utilization in report, valid only in Duration mode \n");
 
+	#ifdef HAVE_HNSDV
+	printf("      --congest_type=<DCQCN, LDCP, HC3, DIP> ");
+	printf(" Use the hnsdv interface to set congestion control algorithm.\n");
+	#endif
+
 	if (tst != FS_RATE) {
 		printf("      --dlid ");
 		printf(" Set a Destination LID instead of getting it from the other side.\n");
@@ -457,6 +466,11 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 		printf("      --use-srq ");
 		printf(" Use a Shared Receive Queue. --rx-depth controls max-wr size of the SRQ \n");
 	}
+
+	#ifdef HAVE_TD_API
+	printf("      --no_lock ");
+	printf(" No lock in IO, including post send, post recv, post srq recv and poll cq \n");
+	#endif
 
 	if (connection_type != RawEth) {
 		printf("      --ipv6 ");
@@ -582,6 +596,11 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 			printf(" Use selected Habana Labs device for RDMA testing\n");
 		}
 
+		if (mlu_memory_supported()) {
+			printf("      --use_mlu=<mlu device id>");
+			printf(" Use selected MLU device for MLUDirect RDMA testing\n");
+		}
+
 		printf("      --use_hugepages ");
 		printf(" Use Hugepages instead of contig, memalign allocations.\n");
 	}
@@ -626,7 +645,12 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 
 	if ((tst == LAT || tst == BW) && verb == WRITE) {
 		printf("      --write_with_imm ");
-		printf(" use write-with-immediate verb instead of write\n");
+		printf(" Use write-with-immediate verb instead of write\n");
+
+		#ifdef HAVE_SRD_WITH_UNSOLICITED_WRITE_RECV
+		printf("      --unsolicited_write ");
+		printf(" Use unsolicited receive for write-with-immediate\n");
+		#endif
 	}
 
 	putchar('\n');
@@ -802,6 +826,7 @@ static void init_perftest_params(struct perftest_parameters *user_param)
 	user_param->use_cuda_dmabuf	= 0;
 	user_param->rocm_device_id	= 0;
 	user_param->neuron_core_id	= 0;
+	user_param->mlu_device_id	= 0;
 	user_param->mmap_file		= NULL;
 	user_param->mmap_offset		= 0;
 	user_param->iters_per_port[0]	= 0;
@@ -863,6 +888,9 @@ static void init_perftest_params(struct perftest_parameters *user_param)
 	user_param->source_ip		= NULL;
 	user_param->has_source_ip	= 0;
 	user_param->use_write_with_imm	= 0;
+	user_param->use_unsolicited_write = 0;
+	user_param->congest_type	= OFF;
+	user_param->no_lock		= OFF;
 }
 
 static int open_file_write(const char* file_path)
@@ -961,6 +989,25 @@ static void change_conn_type(int *cptr, VerbType verb, const char *optarg)
 		exit(1);
 	}
 }
+
+#ifdef HAVE_HNSDV
+static void set_congest_type(int *cgtr, const char *optarg)
+{
+	if (strcmp(congestStr[0], optarg) == 0) {
+		*cgtr = HNSDV_QP_CREATE_ENABLE_DCQCN;
+	} else if (strcmp(congestStr[1], optarg) == 0) {
+		*cgtr = HNSDV_QP_CREATE_ENABLE_LDCP;
+	} else if (strcmp(congestStr[2], optarg) == 0) {
+		*cgtr = HNSDV_QP_CREATE_ENABLE_HC3;
+	} else if (strcmp(congestStr[3], optarg) == 0) {
+		*cgtr = HNSDV_QP_CREATE_ENABLE_DIP;
+	} else {
+		fprintf(stderr, " Invalid congest type. Please choose from {DCQCN,LDCP,HC3,DIP}\n");
+		exit(1);
+	}
+}
+#endif
+
 /******************************************************************************
  *
  ******************************************************************************/
@@ -1065,6 +1112,10 @@ static void force_dependecies(struct perftest_parameters *user_param)
 		}
 
 		if (user_param->connection_type == UD || user_param->connection_type == UC) {
+			if (user_param->use_srq && user_param->iters <= MIN_SRQ_UD_RX_DEPTH) {
+			        user_param->rx_depth = MIN_SRQ_UD_RX_DEPTH;
+			}
+
 			if (user_param->rx_depth == DEF_RX_SEND) {
 				user_param->rx_depth = (user_param->iters < UC_MAX_RX) ? user_param->iters : UC_MAX_RX;
 			}
@@ -1124,7 +1175,22 @@ static void force_dependecies(struct perftest_parameters *user_param)
 		exit (1);
 	}
 
-	if (user_param->use_srq && user_param->num_of_qps > user_param->rx_depth) {
+	/* XRC Part */
+	if (user_param->connection_type == XRC) {
+		if (user_param->work_rdma_cm == ON) {
+			printf(RESULT_LINE);
+			fprintf(stderr," XRC does not support RDMA_CM\n");
+			exit(1);
+		}
+		user_param->use_xrc = ON;
+		user_param->use_srq = ON;
+	}
+
+	if (user_param->connection_type == DC && !user_param->use_srq)
+		user_param->use_srq = ON;
+
+	if (user_param->use_srq && user_param->verb == SEND &&
+	    user_param->num_of_qps > user_param->rx_depth) {
 		printf(RESULT_LINE);
 		printf(" Using SRQ depth should be greater than number of QPs.\n");
 		exit (1);
@@ -1416,20 +1482,6 @@ static void force_dependecies(struct perftest_parameters *user_param)
 		}
 	}
 
-	if (user_param->connection_type == DC && !user_param->use_srq)
-		user_param->use_srq = ON;
-
-	/* XRC Part */
-	if (user_param->connection_type == XRC) {
-		if (user_param->work_rdma_cm == ON) {
-			printf(RESULT_LINE);
-			fprintf(stderr," XRC does not support RDMA_CM\n");
-			exit(1);
-		}
-		user_param->use_xrc = ON;
-		user_param->use_srq = ON;
-	}
-
 	if (!user_param->use_old_post_send)
 	{
 		#ifndef HAVE_IBV_WR_API
@@ -1569,6 +1621,19 @@ static void force_dependecies(struct perftest_parameters *user_param)
 			exit(1);
 		}
 		user_param->cq_mod = 1;
+	}
+
+	if (user_param->use_unsolicited_write) {
+		if (user_param->connection_type != SRD) {
+			printf(RESULT_LINE);
+			fprintf(stderr, " Unsolicited write receive is supported only for SRD\n");
+			exit(1);
+		}
+		if (user_param->verb != WRITE_IMM) {
+			printf(RESULT_LINE);
+			fprintf(stderr, " Unsolicited write receive can only be used with write-with-immediate\n");
+			exit(1);
+		}
 	}
 
 	if ((user_param->use_srq && (user_param->tst == LAT || user_param->machine == SERVER || user_param->duplex == ON)) || user_param->use_xrc)
@@ -1711,7 +1776,7 @@ static void force_dependecies(struct perftest_parameters *user_param)
 
 	if (user_param->memory_type == MEMORY_CUDA && (int)user_param->size <= user_param->inline_size) {
 		printf(RESULT_LINE);
-		fprintf(stderr,"Perftest doesn't supports CUDA tests with inline messages\n");
+		fprintf(stderr,"Perftest doesn't support CUDA tests with inline messages\n");
 		exit(1);
 	}
 
@@ -1755,6 +1820,23 @@ static void force_dependecies(struct perftest_parameters *user_param)
 			user_param->fill_count = 1;
 		}
 	}
+
+	#ifdef HAVE_HNSDV
+	if (user_param->congest_type) {
+		if (user_param->work_rdma_cm == ON)
+		{
+			printf(RESULT_LINE);
+			fprintf(stderr, "rdma_cm does not support setting congest type.\n");
+			exit(1);
+		}
+
+		if (user_param->connection_type == XRC || user_param->connection_type == UD) {
+			printf(RESULT_LINE);
+			fprintf(stdout, "XRC/UD does not support setting congest type.\n");
+			exit(1);
+		}
+	}
+	#endif
 
 	return;
 }
@@ -1917,6 +1999,7 @@ enum ctx_device ib_dev_name(struct ibv_context *context)
 			case 61344 : dev_fname = EFA; break; /* efa0 */
 			case 61345 : dev_fname = EFA; break; /* efa1 */
 			case 61346 : dev_fname = EFA; break; /* efa2 */
+			case 61347 : dev_fname = EFA; break; /* efa3 */
 			case 4223  : dev_fname = ERDMA; break;
 			case 41506 : dev_fname = HNS; break;
 			case 41507 : dev_fname = HNS; break;
@@ -2223,6 +2306,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int use_neuron_flag = 0;
 	static int use_neuron_dmabuf_flag = 0;
 	static int use_hl_flag = 0;
+	static int use_mlu_flag = 0;
 	static int disable_pcir_flag = 0;
 	static int mmap_file_flag = 0;
 	static int mmap_offset_flag = 0;
@@ -2258,6 +2342,9 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int recv_post_list_flag = 0;
 	static int payload_flag = 0;
 	static int use_write_with_imm_flag = 0;
+	#ifdef HAVE_SRD_WITH_UNSOLICITED_WRITE_RECV
+	static int unsolicited_write_flag = 0;
+	#endif
 	#ifdef HAVE_DCS
 	static int log_dci_streams_flag = 0;
 	static int log_active_dci_streams_flag = 0;
@@ -2272,6 +2359,12 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int kek_path_flag = 0;
 	static int credentials_path_flag = 0;
 	static int data_enc_key_app_path_flag = 0;
+	#endif
+	#ifdef HAVE_HNSDV
+	static int congest_type_flag = 0;
+	#endif
+	#ifdef HAVE_TD_API
+	static int no_lock_flag = 0;
 	#endif
 
 	char *server_ip = NULL;
@@ -2352,6 +2445,9 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "run_infinitely",	.has_arg = 0, .flag = &run_inf_flag, .val = 1 },
 			{ .name = "report_gbits",	.has_arg = 0, .flag = &report_fmt_flag, .val = 1},
 			{ .name = "use-srq",		.has_arg = 0, .flag = &srq_flag, .val = 1},
+			#ifdef HAVE_TD_API
+			{ .name = "no_lock",		.has_arg = 0, .flag = &no_lock_flag, .val = 1},
+			#endif
 			{ .name = "use-null-mr",	.has_arg = 0, .flag = &use_null_mr_flag, .val = 1},
 			{ .name = "report-both",	.has_arg = 0, .flag = &report_both_flag, .val = 1},
 			{ .name = "reversed",		.has_arg = 0, .flag = &is_reversed_flag, .val = 1},
@@ -2378,6 +2474,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "use_neuron",		.has_arg = 1, .flag = &use_neuron_flag, .val = 1},
 			{ .name = "use_neuron_dmabuf",	.has_arg = 0, .flag = &use_neuron_dmabuf_flag, .val = 1},
 			{ .name = "use_hl",		.has_arg = 1, .flag = &use_hl_flag, .val = 1},
+			{ .name = "use_mlu",		.has_arg = 1, .flag = &use_mlu_flag, .val = 1},
 			{ .name = "mmap",		.has_arg = 1, .flag = &mmap_file_flag, .val = 1},
 			{ .name = "mmap-offset",	.has_arg = 1, .flag = &mmap_offset_flag, .val = 1},
 			{ .name = "ipv6",		.has_arg = 0, .flag = &ipv6_flag, .val = 1},
@@ -2426,8 +2523,14 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			#if defined HAVE_OOO_ATTR
 			{.name = "use_ooo", .has_arg = 0, .flag = &use_ooo_flag, .val = 1},
 			#endif
+			#ifdef HAVE_HNSDV
+			{ .name = "congest_type", .has_arg = 1, .flag = &congest_type_flag, .val = 1},
+			#endif
 			{.name = "bind_source_ip", .has_arg = 1, .flag = &source_ip_flag, .val = 1},
 			{.name = "write_with_imm", .has_arg = 0, .flag = &use_write_with_imm_flag, .val = 1 },
+			#ifdef HAVE_SRD_WITH_UNSOLICITED_WRITE_RECV
+			{.name = "unsolicited_write", .has_arg = 0, .flag = &unsolicited_write_flag, .val = 1 },
+			#endif
 			{0}
 		};
 		if (!duplicates_checker) {
@@ -2720,6 +2823,12 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				free(duplicates_checker);
 				return FAILURE;
 			case 0: /* required for long options to work. */
+				#ifdef HAVE_HNSDV
+				if (congest_type_flag) {
+					set_congest_type(&user_param->congest_type, optarg);
+					congest_type_flag = 0;
+				}
+				#endif
 				if (pkey_flag) {
 					CHECK_VALUE(user_param->pkey_index,int,"Pkey index",not_int_ptr);
 					pkey_flag = 0;
@@ -2799,13 +2908,14 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				    (use_rocm_flag && !rocm_memory_supported()) ||
 				    (use_neuron_flag && !neuron_memory_supported()) ||
 				    (use_neuron_dmabuf_flag && !neuron_memory_dmabuf_supported()) ||
-				    (use_hl_flag && !hl_memory_supported())) {
+				    (use_hl_flag && !hl_memory_supported()) ||
+				    (use_mlu_flag && !mlu_memory_supported())) {
 					printf(" Unsupported memory type\n");
 					return FAILURE;
 				}
 				/* Memory types are mutually exclucive, make sure we were not already asked to use a different memory type. */
 				if (user_param->memory_type != MEMORY_HOST &&
-				    (mmap_file_flag || use_rocm_flag || use_neuron_flag || use_hl_flag ||
+				    (mmap_file_flag || use_mlu_flag || use_rocm_flag || use_neuron_flag || use_hl_flag ||
 				     ((use_cuda_flag || use_cuda_bus_id_flag) && user_param->memory_type != MEMORY_CUDA))) {
 					fprintf(stderr, " Can't use multiple memory types\n");
 					return FAILURE;
@@ -2862,6 +2972,12 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					user_param->memory_type = MEMORY_HL;
 					user_param->memory_create = hl_memory_create;
 					use_hl_flag = 0;
+				}
+				if (use_mlu_flag) {
+					CHECK_VALUE_NON_NEGATIVE(user_param->mlu_device_id,int,"MLU device",not_int_ptr);
+					user_param->memory_type = MEMORY_MLU;
+					user_param->memory_create = mlu_memory_create;
+					use_mlu_flag = 0;
 				}
 				if (flow_label_flag) {
 					CHECK_VALUE(user_param->flow_label,int,"flow label",not_int_ptr);
@@ -3055,6 +3171,12 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					user_param->verb = WRITE_IMM;
 					use_write_with_imm_flag = 0;
 				}
+				#ifdef HAVE_SRD_WITH_UNSOLICITED_WRITE_RECV
+				if (unsolicited_write_flag) {
+					user_param->use_unsolicited_write = 1;
+					unsolicited_write_flag = 0;
+				}
+				#endif
 				break;
 			default:
 				  fprintf(stderr," Invalid Command or flag.\n");
@@ -3085,6 +3207,12 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	if (srq_flag) {
 		user_param->use_srq = 1;
 	}
+
+	#ifdef HAVE_TD_API
+	if (no_lock_flag) {
+		user_param->no_lock = 1;
+	}
+	#endif
 
 	if (use_null_mr_flag) {
 		user_param->use_null_mr = 1;
@@ -3430,15 +3558,24 @@ void ctx_print_test_info(struct perftest_parameters *user_param)
 	printf(" Number of qps   : %d\t\tTransport type : %s\n", user_param->num_of_qps, transport_str(user_param->transport_type));
 	printf(" Connection type : %s\t\tUsing SRQ      : %s\n", connStr[user_param->connection_type], user_param->use_srq ? "ON"  : "OFF");
 	#ifdef HAVE_RO
-	printf(" PCIe relax order: %s\n", user_param->disable_pcir ? "OFF"  : "ON");
+	#ifdef HAVE_TD_API
+	printf(" PCIe relax order: %s\t\tLock-free      : %s\n", user_param->disable_pcir ? "OFF"  : "ON", user_param->no_lock ? "ON" : "OFF");
+	#else
+	printf(" PCIe relax order: %s\t\tLock-free      : %s\n", user_param->disable_pcir ? "OFF"  : "ON", "Unsupported");
+	#endif //HAVE_TD_API
 	if ((check_pcie_relaxed_ordering_compliant() == false) &&
 	    (user_param->disable_pcir == 0)) {
 		printf(" WARNING: CPU is not PCIe relaxed ordering compliant.\n");
 		printf(" WARNING: You should disable PCIe RO with `--disable_pcie_relaxed` for both server and client.\n");
 	}
 	#else
-	printf(" PCIe relax order: %s\n", "Unsupported");
+	#ifdef HAVE_TD_API
+	printf(" PCIe relax order: %s\t\tLock-free      : %s\n", "Unsupported", user_param->no_lock ? "ON" : "OFF");
+	#else
+	printf(" PCIe relax order: %s\t\tLock-free	: %s\n", "Unsupported", "Unsupported");
+	#endif //HAVE_TD_API
 	#endif
+
 	printf(" ibv_wr* API     : %s\n", user_param->use_old_post_send ? "OFF" : "ON");
 	if (user_param->machine == CLIENT || user_param->duplex) {
 		printf(" TX depth        : %d\n",user_param->tx_depth);
@@ -3731,6 +3868,9 @@ static void write_test_info_to_file(int out_json_fds, struct perftest_parameters
 		dprintf(out_json_fds, "\"Outstand_reads\": %d,\n",user_param->out_reads);
 
 	dprintf(out_json_fds, "\"rdma_cm_QPs\": \"%s\",\n",qp_state[user_param->work_rdma_cm]);
+
+	if (user_param->memory_type == MEMORY_CUDA)
+		dprintf(out_json_fds, "\"cuda_device\": %d,\n",user_param->cuda_device_id);
 
 	if (user_param->use_rdma_cm)
 		temp = 1;

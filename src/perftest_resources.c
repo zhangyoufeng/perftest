@@ -1317,6 +1317,20 @@ int destroy_ctx(struct pingpong_context *ctx,
 	}
 	#endif
 
+	#ifdef HAVE_TD_API
+	if (user_param->no_lock) {
+		if (ibv_dealloc_pd(ctx->pad)) {
+			fprintf(stderr, "Failed to deallocate PAD - %s\n", strerror(errno));
+			test_result = 1;
+		}
+
+		if (ibv_dealloc_td(ctx->td)) {
+			fprintf(stderr, "Failed to deallocate TD - %s\n", strerror(errno));
+			test_result = 1;
+		}
+	}
+	#endif
+
 	if (ibv_dealloc_pd(ctx->pd)) {
 		fprintf(stderr, "Failed to deallocate PD - %s\n", strerror(errno));
 		test_result = 1;
@@ -1517,6 +1531,51 @@ int create_reg_cqs(struct pingpong_context *ctx,
 		   struct perftest_parameters *user_param,
 		   int tx_buffer_depth, int need_recv_cq)
 {
+#ifdef HAVE_CQ_EX
+	struct ibv_cq_init_attr_ex send_cq_attr = {
+		.cqe = tx_buffer_depth * user_param->num_of_qps,
+		.cq_context = NULL,
+		.channel = ctx->send_channel,
+		.comp_vector = user_param->eq_num,
+	};
+
+	#ifdef HAVE_TD_API
+	if (user_param->no_lock) {
+		send_cq_attr.parent_domain = ctx->pad;
+		send_cq_attr.comp_mask = IBV_CQ_INIT_ATTR_MASK_PD;
+	}
+	#endif
+	ctx->send_cq = ibv_cq_ex_to_cq(ibv_create_cq_ex(ctx->context, &send_cq_attr));
+	if (!ctx->send_cq) {
+		if (!user_param->no_lock && errno == EOPNOTSUPP)
+			goto cq_ex_not_supported;
+		fprintf(stderr, "Couldn't create CQ\n");
+		return FAILURE;
+	}
+
+	if (need_recv_cq) {
+		struct ibv_cq_init_attr_ex recv_cq_attr = {
+			.cqe = user_param->rx_depth * user_param->num_of_qps,
+			.cq_context = NULL,
+			.channel = ctx->recv_channel,
+			.comp_vector = user_param->eq_num,
+		};
+		#ifdef HAVE_TD_API
+		if (user_param->no_lock) {
+			recv_cq_attr.parent_domain = ctx->pad;
+			recv_cq_attr.comp_mask = IBV_CQ_INIT_ATTR_MASK_PD;
+		}
+		#endif
+		ctx->recv_cq = ibv_cq_ex_to_cq(ibv_create_cq_ex(ctx->context, &recv_cq_attr));
+		if (!ctx->recv_cq) {
+			fprintf(stderr, "Couldn't create a receiver CQ\n");
+			return FAILURE;
+		}
+	}
+	return SUCCESS;
+
+cq_ex_not_supported:
+#endif
 	ctx->send_cq = ibv_create_cq(ctx->context,tx_buffer_depth *
 					user_param->num_of_qps, NULL, ctx->send_channel, user_param->eq_num);
 	if (!ctx->send_cq) {
@@ -1941,6 +2000,30 @@ int ctx_init(struct pingpong_context *ctx, struct perftest_parameters *user_para
 		goto comp_channel;
 	}
 
+	#ifdef HAVE_TD_API
+	/* Allocating the Thread domain, Parent domain. */
+	if (user_param->no_lock) {
+		struct ibv_td_init_attr td_attr = {0};
+		ctx->td = ibv_alloc_td(ctx->context, &td_attr);
+		if (!ctx->td) {
+			fprintf(stderr, "Couldn't allocate TD\n");
+			goto pd;
+		}
+
+		struct ibv_parent_domain_init_attr pad_attr = {
+			.pd = ctx->pd,
+			.td = ctx->td,
+			.comp_mask = 0,
+		};
+
+		ctx->pad = ibv_alloc_parent_domain(ctx->context, &pad_attr);
+		if (!ctx->pad) {
+			fprintf(stderr, "Couldn't allocate PAD\n");
+			goto td;
+		}
+	}
+	#endif
+
 	#ifdef HAVE_AES_XTS
 	if(user_param->aes_xts){
 		struct mlx5dv_dek_init_attr dek_attr = {};
@@ -2126,6 +2209,16 @@ dek:
 			mlx5dv_dek_destroy(ctx->dek[i]);
 	#endif
 
+#ifdef HAVE_TD_API
+	if (user_param->no_lock)
+		ibv_dealloc_pd(ctx->pad);
+
+td:
+	if (user_param->no_lock)
+		ibv_dealloc_td(ctx->td);
+pd:
+#endif
+
 	ibv_dealloc_pd(ctx->pd);
 
 comp_channel:
@@ -2219,6 +2312,9 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 	struct efadv_qp_init_attr efa_attr = {};
 	#endif
 	#endif
+	#ifdef HAVE_HNSDV
+	struct hnsdv_qp_init_attr hns_attr = {};
+	#endif
 
 	attr.send_cq = ctx->send_cq;
 	attr.recv_cq = (user_param->verb == SEND || user_param->verb == WRITE_IMM) ? ctx->recv_cq : ctx->send_cq;
@@ -2291,7 +2387,13 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 		else if (opcode == IBV_WR_RDMA_READ)
 			attr_ex.send_ops_flags |= IBV_QP_EX_WITH_RDMA_READ;
 	}
+
+	#ifdef HAVE_TD_API
+	attr_ex.pd = user_param->no_lock ? ctx->pad : ctx->pd;
+	#else
 	attr_ex.pd = ctx->pd;
+	#endif
+
 	attr_ex.comp_mask |= IBV_QP_INIT_ATTR_SEND_OPS_FLAGS | IBV_QP_INIT_ATTR_PD;
 	attr_ex.send_cq = attr.send_cq;
 	attr_ex.recv_cq = attr.recv_cq;
@@ -2332,6 +2434,10 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 		#ifdef HAVE_SRD
 		#ifdef HAVE_IBV_WR_API
 		efa_attr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
+		#ifdef HAVE_SRD_WITH_UNSOLICITED_WRITE_RECV
+		if (user_param->use_unsolicited_write)
+			efa_attr.flags |= EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV;
+		#endif
 		qp = efadv_create_qp_ex(ctx->context, &attr_ex,
 					&efa_attr, sizeof(efa_attr));
 		#else
@@ -2382,6 +2488,15 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 			#endif // HAVE_AES_XTS
 			else
 			#endif // HAVE_MLX5DV
+
+			#ifdef HAVE_HNSDV
+			if (user_param->congest_type) {
+				hns_attr.comp_mask = HNSDV_QP_INIT_ATTR_MASK_QP_CONGEST_TYPE;
+				hns_attr.congest_type = user_param->congest_type;
+				qp = hnsdv_create_qp(ctx->context, &attr_ex, &hns_attr);
+			}
+			else
+			#endif //HAVE_HNSDV
 				qp = ibv_create_qp_ex(ctx->context, &attr_ex);
 		}
 		else
@@ -3689,7 +3804,7 @@ int run_iter_bw_server(struct pingpong_context *ctx, struct perftest_parameters 
 					}
 					//coverity[uninit_use]
 					if ((user_param->test_type==DURATION || posted_per_qp[wc_id] + user_param->recv_post_list <= user_param->iters) &&
-							unused_recv_for_qp[wc_id] >= user_param->recv_post_list) {
+					    unused_recv_for_qp[wc_id] >= user_param->recv_post_list && !user_param->use_unsolicited_write) {
 						if (user_param->use_srq) {
 							if (ibv_post_srq_recv(ctx->srq, &ctx->rwr[wc_id * user_param->recv_post_list], &bad_wr_recv)) {
 								fprintf(stderr, "Couldn't post recv SRQ. QP = %d: counter=%lu\n", wc_id,rcnt);
@@ -3976,7 +4091,7 @@ int run_iter_bw_infinitely_server(struct pingpong_context *ctx, struct perftest_
 				}
 				user_param->iters++;
 				unused_recv_for_qp[wc[i].wr_id]++;
-				if (unused_recv_for_qp[wc[i].wr_id] >= user_param->recv_post_list) {
+				if (unused_recv_for_qp[wc[i].wr_id] >= user_param->recv_post_list && !user_param->use_unsolicited_write) {
 					if (user_param->use_srq) {
 						if (ibv_post_srq_recv(ctx->srq, &ctx->rwr[wc[i].wr_id * user_param->recv_post_list],&bad_wr_recv)) {
 							fprintf(stderr, "Couldn't post recv SRQ. QP = %d:\n",(int)wc[i].wr_id);
@@ -4230,7 +4345,7 @@ int run_iter_bi(struct pingpong_context *ctx,
 				}
 
 				if ((user_param->test_type==DURATION || posted_per_qp[wc[i].wr_id] + user_param->recv_post_list <= user_param->iters) &&
-						unused_recv_for_qp[wc[i].wr_id] >= user_param->recv_post_list) {
+				    unused_recv_for_qp[wc[i].wr_id] >= user_param->recv_post_list && !user_param->use_unsolicited_write) {
 					if (user_param->use_srq) {
 						if (ibv_post_srq_recv(ctx->srq, &ctx->rwr[wc[i].wr_id * user_param->recv_post_list],&bad_wr_recv)) {
 							fprintf(stderr, "Couldn't post recv SRQ. QP = %d: counter=%d\n",(int)wc[i].wr_id,(int)totrcnt);
@@ -4483,7 +4598,7 @@ int run_iter_lat_write(struct pingpong_context *ctx,struct perftest_parameters *
 
 		if (ccnt < user_param->iters || user_param->test_type == DURATION) {
 
-			do { ne = ibv_poll_cq(ctx->send_cq, 1, &wc); } while (ne == 0);
+			do { ne = ibv_poll_cq(ctx->send_cq, 1, &wc); } while (ne == 0 && !(user_param->test_type == DURATION && user_param->state == END_STATE));
 
 			if(ne > 0) {
 
@@ -4562,7 +4677,7 @@ int run_iter_lat_write_imm(struct pingpong_context *ctx,struct perftest_paramete
 			rcnt++;
 
 			/* Poll for a completion */
-			do { ne = ibv_poll_cq(ctx->recv_cq, 1, &wc); } while (ne == 0);
+			do { ne = ibv_poll_cq(ctx->recv_cq, 1, &wc); } while (ne == 0 && !(user_param->test_type == DURATION && user_param->state == END_STATE));
 			if (ne > 0) {
 				if (wc.status != IBV_WC_SUCCESS) {
 					//coverity[uninit_use_in_call]
@@ -4574,7 +4689,8 @@ int run_iter_lat_write_imm(struct pingpong_context *ctx,struct perftest_paramete
 				 * is enough space in the rx_depth,
 				 * post that you received a packet.
 				 */
-				if (user_param->test_type == DURATION || (rcnt + size_per_qp <= user_param->iters)) {
+				if ((user_param->test_type == DURATION || (rcnt + size_per_qp <= user_param->iters)) &&
+				    !user_param->use_unsolicited_write) {
 					if (user_param->use_srq) {
 						if (ibv_post_srq_recv(ctx->srq, &ctx->rwr[wc.wr_id], &bad_wr_recv)) {
 							fprintf(stderr, "Couldn't post recv SRQ. QP = %d: counter=%lu\n",(int)wc.wr_id, rcnt);
